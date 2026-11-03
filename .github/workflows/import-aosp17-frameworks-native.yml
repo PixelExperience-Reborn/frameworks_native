@@ -1,0 +1,100 @@
+name: Import pinned official AOSP17 frameworks/native
+
+on:
+  push:
+    branches:
+      - ci/a17-frameworks-native-import-20261103
+    paths:
+      - .github/workflows/import-aosp17-frameworks-native.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aosp17-frameworks-native-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      AOSP_URL: https://android.googlesource.com/platform/frameworks/native
+      AOSP_REF: refs/tags/android-17.0.0_r1
+      EXPECTED_COMMIT: ae266dcb706d083868578cfedce381ef44488a07
+      EXPECTED_TREE: d0554d8875771ee2702dc51448d6b24a761bbe7a
+      OUTPUT_BRANCH: port/a17-frameworks-native-aosp17-base-20261103
+    steps:
+      - name: Fetch authentic official AOSP17 source and verify commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aosp-native"
+          mkdir -p "$work"
+          git -C "$work" init -q
+          git -C "$work" remote add official "$AOSP_URL"
+          git -C "$work" fetch --no-tags official "$AOSP_REF"
+          actual="$(git -C "$work" rev-parse 'FETCH_HEAD^{commit}')"
+          tree="$(git -C "$work" rev-parse "$actual^{tree}")"
+          test "$actual" = "$EXPECTED_COMMIT"
+          test "$tree" = "$EXPECTED_TREE"
+          git -C "$work" fsck --connectivity-only --no-reflogs
+          echo "Verified AOSP17 frameworks/native commit $actual and tree $tree"
+
+      - name: Publish full AOSP history when GitHub permits, exact tree otherwise
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/aosp-native"
+          destination="https://github.com/$GITHUB_REPOSITORY.git"
+          ref="refs/heads/$OUTPUT_BRANCH"
+          if [[ -n "$(git ls-remote "$destination" "$ref" | cut -f1)" ]]; then
+            echo "Ref already exists. Refusing to overwrite."
+            exit 1
+          fi
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          set +e
+          git -C "$work" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --no-thin "$destination" "$EXPECTED_COMMIT:$ref" \
+            > "$RUNNER_TEMP/full-push.log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "Full official AOSP history imported with unchanged commit."
+            exit 0
+          fi
+          tail -n 12 "$RUNNER_TEMP/full-push.log"
+          if ! grep -Eq "GH001|exceeds GitHub.s file size limit" "$RUNNER_TEMP/full-push.log"; then
+            echo "Unexpected upload failure; no source substitution attempted."
+            exit "$status"
+          fi
+          oversized="$(git -C "$work" ls-tree -r -l "$EXPECTED_COMMIT" |
+            awk '$2 == "blob" && $4 ~ /^[0-9]+$/ && $4 > 100000000 {print}')"
+          if [[ -n "$oversized" ]]; then
+            echo "AOSP17 source itself has >100MB files; cannot safely snapshot:"
+            echo "$oversized"
+            exit 1
+          fi
+          {
+            echo "Import official AOSP 17 frameworks/native source snapshot"
+            echo
+            echo "Upstream tag: android-17.0.0_r1"
+            echo "Upstream commit: $EXPECTED_COMMIT"
+            echo "Exact source tree: $EXPECTED_TREE"
+            echo "Upstream URL: $AOSP_URL"
+            echo "Historic blobs exceeded GitHub's size limit; only exact"
+            echo "release source tree is imported. PE history remains on seventeen."
+          } > "$RUNNER_TEMP/message.txt"
+          snapshot="$(GIT_AUTHOR_NAME='github-actions[bot]' \
+            GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_COMMITTER_NAME='github-actions[bot]' \
+            GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            git -C "$work" commit-tree "$EXPECTED_TREE" -F "$RUNNER_TEMP/message.txt")"
+          test "$(git -C "$work" rev-parse "$snapshot^{tree}")" = "$EXPECTED_TREE"
+          git -C "$work" \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --no-thin "$destination" "$snapshot:$ref"
+          echo "Published exact AOSP17 frameworks/native source tree snapshot."
